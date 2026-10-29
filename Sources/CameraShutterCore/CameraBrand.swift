@@ -1,6 +1,6 @@
 import Foundation
 
-public enum CameraBrand: String, CaseIterable, Identifiable, Sendable {
+public enum CameraBrand: String, CaseIterable, Identifiable, Codable, Sendable {
     case canon = "Canon"
     case nikon = "Nikon"
     case sony = "Sony"

@@ -13,9 +13,11 @@ public class CameraManager: NSObject, ObservableObject {
     @Published public var currentReport: ShutterReport?
     @Published public var errorMessage: String?
     @Published public var logMessages: [String] = []
+    @Published public var history: [ShutterReport] = []
     
     private var deviceBrowser: ICDeviceBrowser!
     private var transactionCounter: UInt32 = 1
+    private let historyKey = "CameraShutterCount_History_v1"
     
     public override init() {
         super.init()
@@ -23,7 +25,8 @@ public class CameraManager: NSObject, ObservableObject {
         self.deviceBrowser.delegate = self
         self.deviceBrowser.browsedDeviceTypeMask = ICDeviceTypeMask(rawValue: ICDeviceTypeMask.camera.rawValue)!
         self.deviceBrowser.start()
-        log("相機監控服務已啟動，正在掃描 USB 相機裝置...")
+        loadHistory()
+        log("相機通訊中樞已就緒，ImageCaptureCore 正在監聽 USB 埠...")
     }
     
     public func log(_ message: String) {
@@ -40,29 +43,66 @@ public class CameraManager: NSObject, ObservableObject {
         return transactionCounter
     }
     
+    // MARK: - History Persistence
+    private func loadHistory() {
+        guard let data = UserDefaults.standard.data(forKey: historyKey),
+              let list = try? JSONDecoder().decode([ShutterReport].self, from: data) else {
+            return
+        }
+        self.history = list
+    }
+    
+    public func recordReport(_ report: ShutterReport) {
+        // Remove duplicate if same serial and count
+        history.removeAll { $0.serialNumber == report.serialNumber && $0.shutterCount == report.shutterCount }
+        history.insert(report, at: 0)
+        if history.count > 50 {
+            history = Array(history.prefix(50))
+        }
+        if let data = try? JSONEncoder().encode(history) {
+            UserDefaults.standard.set(data, forKey: historyKey)
+        }
+    }
+    
+    public func clearHistory() {
+        history.removeAll()
+        UserDefaults.standard.removeObject(forKey: historyKey)
+        log("已清空本地檢測歷史紀錄。")
+    }
+    
     // MARK: - Simulation / Demo Mode (Multi-Brand Support)
     public func simulateDevice(brand: CameraBrand = .canon) {
         let modelName: String
         let shutterCount: UInt32
         let ratedLife: UInt32
+        let serial: String
         
         switch brand {
         case .canon:
-            modelName = "EOS 5D Mark IV"
-            shutterCount = 26374
-            ratedLife = 150000
+            modelName = "Canon EOS 5D Mark IV"
+            shutterCount = 26_374
+            ratedLife = 150_000
+            serial = "SN-CANON-08204"
         case .nikon:
             modelName = "Nikon Z8"
-            shutterCount = 14820
-            ratedLife = 400000
+            shutterCount = 14_820
+            ratedLife = 400_000
+            serial = "SN-NIKON-93105"
         case .sony:
-            modelName = "Sony A7 IV"
-            shutterCount = 38910
-            ratedLife = 200000
+            modelName = "Sony Alpha 7 IV"
+            shutterCount = 38_910
+            ratedLife = 200_000
+            serial = "SN-SONY-66281"
+        case .fujifilm:
+            modelName = "Fujifilm X-T5"
+            shutterCount = 18_450
+            ratedLife = 150_000
+            serial = "SN-FUJI-42901"
         default:
-            modelName = "Universal Camera"
-            shutterCount = 12000
-            ratedLife = 150000
+            modelName = "Pentax K-1 Mark II"
+            shutterCount = 42_100
+            ratedLife = 300_000
+            serial = "SN-PENTAX-1104"
         }
         
         log("啟動 [\(brand.rawValue)] 模擬測試: \(modelName)...")
@@ -79,30 +119,36 @@ public class CameraManager: NSObject, ObservableObject {
             self.log("配對 \(brand.rawValue)Driver 硬體專屬驅動模組...")
         }
         
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
             if brand == .canon {
-                self.log("發送 MonOpen 叫醒 Canon MPU...")
+                self.log("發送 MonOpen (0x9052, sub 0x0020) 叫醒 Canon MPU...")
                 self.log("讀取 MPU 位址 0x1001，解碼快門數: \(shutterCount)")
-                self.log("發送 MonClose 安全關閉 MPU 監控...")
+                self.log("發送 MonClose (0x9053) 安全釋放 MPU 監控...")
             } else if brand == .nikon {
                 self.log("發送 Nikon PTP 屬性 0xD100 查詢...")
                 self.log("Nikon PTP 回傳成功，快門數: \(shutterCount)")
-            } else {
+            } else if brand == .sony {
                 self.log("讀取 Sony EXIF/PTP 遙測標籤，快門數: \(shutterCount)")
+            } else if brand == .fujifilm {
+                self.log("解析 Fujifilm RAF MakerNotes 快門標記: \(shutterCount)")
+            } else {
+                self.log("讀取通用 PTP 標記，快門數: \(shutterCount)")
             }
             
             Task { @MainActor in
-                self.currentReport = ShutterReport(
+                let rep = ShutterReport(
                     cameraName: modelName,
                     brand: brand,
-                    serialNumber: "SN-\(brand.rawValue.uppercased())-80129",
+                    serialNumber: serial,
                     shutterCount: shutterCount,
                     mirrorCount: brand == .canon ? (shutterCount - 226) : nil,
                     totalActuations: shutterCount + 120,
                     ratedLife: ratedLife,
-                    readingMethod: brand == .canon ? .ptpMpuMonitor : .ptpLegacy,
+                    readingMethod: brand == .canon ? .ptpMpuMonitor : (brand == .nikon ? .ptpNikon : .exifFile),
                     timestamp: Date()
                 )
+                self.currentReport = rep
+                self.recordReport(rep)
                 self.isReading = false
             }
         }
@@ -144,12 +190,13 @@ public class CameraManager: NSObject, ObservableObject {
             )
             await MainActor.run {
                 self.currentReport = report
+                self.recordReport(report)
                 self.isReading = false
             }
             log("快門數讀取成功: \(report.shutterCount) 次")
         } catch {
             await MainActor.run {
-                self.errorMessage = error.localizedDescription
+                self.errorMessage = "讀取快門數失敗: \(error.localizedDescription)"
                 self.isReading = false
             }
             log("讀取失敗: \(error.localizedDescription)")
@@ -160,38 +207,27 @@ public class CameraManager: NSObject, ObservableObject {
 // MARK: - ICDeviceBrowserDelegate & ICCameraDeviceDelegate
 extension CameraManager: ICDeviceBrowserDelegate, ICCameraDeviceDelegate {
     public func deviceBrowser(_ browser: ICDeviceBrowser, didAdd device: ICDevice, moreComing: Bool) {
-        guard let camera = device as? ICCameraDevice else { return }
-        let name = camera.name ?? "相機裝置"
-        let brand = CameraBrand.detect(from: name)
-        
-        log("發現相機: \(name) (\(brand.rawValue))")
-        Task { @MainActor in
+        log("偵測到相機裝置接入: \(device.name ?? "Unknown")")
+        if let camera = device as? ICCameraDevice {
             self.connectedCamera = camera
-            self.cameraName = name
-            self.detectedBrand = brand
+            self.cameraName = camera.name ?? "Camera"
+            self.detectedBrand = CameraBrand.detect(from: cameraName)
+            self.isConnected = true
+            camera.delegate = self
+            camera.requestOpenSession()
+            log("正在開啟相機連線通訊工作階段...")
         }
-        camera.delegate = self
-        camera.requestOpenSession()
     }
     
     public func deviceBrowser(_ browser: ICDeviceBrowser, didRemove device: ICDevice, moreGoing: Bool) {
-        if device == connectedCamera {
-            log("相機已拔除中斷連線。")
+        log("相機已拔除中斷: \(device.name ?? "Unknown")")
+        if self.connectedCamera == device {
             Task { @MainActor in
                 self.connectedCamera = nil
                 self.cameraName = "未連接相機"
+                self.detectedBrand = .generic
                 self.isConnected = false
                 self.currentReport = nil
-                self.detectedBrand = .generic
-            }
-        }
-    }
-    
-    public func didRemove(_ device: ICDevice) {
-        if device == connectedCamera {
-            Task { @MainActor in
-                self.connectedCamera = nil
-                self.isConnected = false
             }
         }
     }
@@ -232,4 +268,5 @@ extension CameraManager: ICDeviceBrowserDelegate, ICCameraDeviceDelegate {
     public func deviceDidBecomeReady(withCompleteContentCatalog device: ICCameraDevice) {}
     public func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) {}
     public func cameraDeviceDidEnableAccessRestriction(_ device: ICDevice) {}
+    public func didRemove(_ device: ICDevice) {}
 }

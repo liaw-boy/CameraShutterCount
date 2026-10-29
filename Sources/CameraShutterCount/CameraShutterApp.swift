@@ -10,6 +10,6 @@ public struct CameraShutterApp: App {
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified)
-        .defaultSize(width: 520, height: 560)
+        .defaultSize(width: 580, height: 700)
     }
 }
